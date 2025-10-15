@@ -133,7 +133,9 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to convert text to phonemes: {:?}", e))?;
 
         // Join phonemes into a single string
-        let phonemes_str = phonemes.join("");
+        let mut phonemes_str = phonemes.join("");
+        phonemes_str.insert(0, '$');
+        phonemes_str.push('$');
 
         // Tokenize phonemes using proper vocabulary
         let tokens = self.tokenize(&phonemes_str);
