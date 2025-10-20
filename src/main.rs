@@ -121,60 +121,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Get text to speak based on command
-    let (text, voice) = match cli.command {
-        Some(Commands::Say { text }) => {
-            (text, cli.voice)
-        }
+    //let (text, voice) = match cli.command {
+    //    Some(Commands::Say { text }) => {
+    //        (text, cli.voice)
+    //    }
+    //
+    //    Some(Commands::Pipe) => {
+    //        // Read from stdin
+    //        let stdin = io::stdin();
+    //        let mut lines = Vec::new();
+    //        for line in stdin.lock().lines() {
+    //            lines.push(line?);
+    //        }
+    //        (lines.join(" "), cli.voice)
+    //    }
+    //
+    //    Some(Commands::Alert { alert_type, message }) => {
+    //        let text = message.unwrap_or_else(|| alert_type.default_message().to_string());
+    //        let voice = alert_type.voice().to_string();
+    //        (text, voice)
+    //    }
+    //
+    //    Some(Commands::Context { text, prefix }) => {
+    //        let full_text = format!("{} {}", prefix, text);
+    //        // Use a clear, professional voice for context summaries
+    //        (full_text, "bf_isabella".to_string())
+    //    }
+    //
+    //    None => {
+    //        // Default: read from stdin if available, otherwise show help
+    //        if atty::is(atty::Stream::Stdin) {
+    //            eprintln!("💡 No input provided. Use --help for usage information.");
+    //            eprintln!("\nQuick examples:");
+    //            eprintln!("  kokoro-speak say \"Hello world!\"");
+    //            eprintln!("  echo \"Build complete\" | kokoro-speak pipe");
+    //            eprintln!("  kokoro-speak alert success");
+    //            eprintln!("  kokoro-speak context \"Found 5 TypeScript files with 200 lines total\"");
+    //            return Ok(());
+    //        }
+    //
+    //        let stdin = io::stdin();
+    //        let mut lines = Vec::new();
+    //        for line in stdin.lock().lines() {
+    //            lines.push(line?);
+    //        }
+    //        (lines.join(" "), cli.voice)
+    //    }
+    //};
 
-        Some(Commands::Pipe) => {
-            // Read from stdin
-            let stdin = io::stdin();
-            let mut lines = Vec::new();
-            for line in stdin.lock().lines() {
-                lines.push(line?);
-            }
-            (lines.join(" "), cli.voice)
-        }
+    let voice = "am_michael".to_string();
+    let text = "Gimme a break! I wasn’t trying to be funny, and come on, that sometimes was unnecessary.".to_string();
 
-        Some(Commands::Alert { alert_type, message }) => {
-            let text = message.unwrap_or_else(|| alert_type.default_message().to_string());
-            let voice = alert_type.voice().to_string();
-            (text, voice)
-        }
-
-        Some(Commands::Context { text, prefix }) => {
-            let full_text = format!("{} {}", prefix, text);
-            // Use a clear, professional voice for context summaries
-            (full_text, "bf_isabella".to_string())
-        }
-
-        None => {
-            // Default: read from stdin if available, otherwise show help
-            if atty::is(atty::Stream::Stdin) {
-                eprintln!("💡 No input provided. Use --help for usage information.");
-                eprintln!("\nQuick examples:");
-                eprintln!("  kokoro-speak say \"Hello world!\"");
-                eprintln!("  echo \"Build complete\" | kokoro-speak pipe");
-                eprintln!("  kokoro-speak alert success");
-                eprintln!("  kokoro-speak context \"Found 5 TypeScript files with 200 lines total\"");
-                return Ok(());
-            }
-
-            let stdin = io::stdin();
-            let mut lines = Vec::new();
-            for line in stdin.lock().lines() {
-                lines.push(line?);
-            }
-            (lines.join(" "), cli.voice)
-        }
-    };
+    let output_path = cli.output;
+    //let output_path = Some("output.wav".to_string());
 
     // Synthesize speech
     let audio = engine.synthesize(&text, Some(&voice))
         .map_err(|e| format!("Synthesis failed: {}", e))?;
 
     // Output to file or play
-    if let Some(output_path) = cli.output {
+    if let Some(output_path) = output_path {
         engine.save_wav(&output_path, &audio)
             .map_err(|e| format!("Failed to save audio: {}", e))?;
         println!("💾 Saved to: {}", output_path);

@@ -11,3 +11,5 @@ voices-v1.0.bin
 .claude_consciousness.m8
 .env
 .env.local
+
+.vs/

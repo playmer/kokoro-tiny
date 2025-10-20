@@ -22,10 +22,13 @@ path = "src/main.rs"
 ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
 
 # Essential for text processing and audio
-espeak-rs = "0.1.9"
+espeak-rs = { path = "../piper-rs/crates/espeak-rs", version = "0.1.9"}
+#espeak-rs = "0.1.9"
 hound = "3.5.1"  # WAV support built-in
 ndarray = "0.16.1"
 ndarray-npy = "0.9.1"
+phonetisaurus-g2p = "0.1.1"
+unicode-segmentation = "1.12.0"
 
 # Minimal async support for downloading model
 tokio = { version = "1.45", features = ["fs", "rt"] }
@@ -48,6 +51,7 @@ audiopus = { version = "0.2", optional = true }
 default = ["playback"]
 mp3 = ["mp3lame-encoder"]
 cuda = ["ort/cuda"]
+rocm = ["ort/rocm"]
 playback = ["cpal", "rodio"]
 opus-format = ["audiopus"]
 all-formats = ["mp3", "opus-format"]
