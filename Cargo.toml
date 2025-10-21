@@ -19,7 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Core ONNX Runtime for model inference
-ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
+ort = { version = "2.0.0-rc.10", features = ["load-dynamic"] }
+#ort = { version = "2.0.0-rc.10", features = ["download-binaries", "load-dynamic"] }
 
 # Essential for text processing and audio
 espeak-rs = { path = "../piper-rs/crates/espeak-rs", version = "0.1.9"}
@@ -46,6 +47,7 @@ mp3lame-encoder = { version = "0.2", optional = true }
 cpal = { version = "0.15", optional = true }
 rodio = { version = "0.19", optional = true }
 audiopus = { version = "0.2", optional = true }
+threadpool = "1.8.1"
 
 [features]
 default = ["playback"]

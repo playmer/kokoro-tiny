@@ -26,8 +26,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use std::sync::mpsc::channel;
+
 use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ROCmExecutionProvider};
 use ort::value::TensorValueType;
+use threadpool::ThreadPool;
 use unicode_segmentation::UnicodeSegmentation;
 use espeak_rs::{text_to_phonemes, _text_to_phonemes};
 use ndarray::{ArrayBase, IxDyn, OwnedRepr};
@@ -134,20 +137,20 @@ impl Phonemizer {
 
         let mut i = 0;
 
-        while phonemes[i].len() > 510 {
-            if Self::split_index(&mut phonemes, i, ';') && phonemes[i].len() > 510 {
+        while phonemes[i].len() > 509 {
+            if Self::split_index(&mut phonemes, i, ';') && phonemes[i].len() > 509 {
                 continue;
             }
             
-            if phonemes[i].len() > 510 && Self::split_index(&mut phonemes, i, ',') && phonemes[i].len() > 510 {
+            if phonemes[i].len() > 509 && Self::split_index(&mut phonemes, i, ',') && phonemes[i].len() > 509 {
                 continue;
             }
 
-            if phonemes[i].len() > 510 && Self::split_index(&mut phonemes, i, '-') && phonemes[i].len() > 510 {
+            if phonemes[i].len() > 509 && Self::split_index(&mut phonemes, i, '-') && phonemes[i].len() > 509 {
                 continue;
             }
 
-            if phonemes[i].len() > 510 && Self::split_index(&mut phonemes, i, ' ') && phonemes[i].len() > 510 {
+            if phonemes[i].len() > 509 && Self::split_index(&mut phonemes, i, ' ') && phonemes[i].len() > 509 {
                 continue;
             }
 
@@ -220,28 +223,90 @@ impl Phonemizer {
 }
 
 
+struct SessionHandler {
+    session: Arc<Mutex<Session>>,
+    voice_styles: Vec<Vec<f32>>
+}
+
+impl SessionHandler {
+    fn new(session: Arc<Mutex<Session>>, voice_styles: Vec<Vec<f32>>) -> SessionHandler {
+        SessionHandler {
+            session,
+            voice_styles,
+        }
+    }
+
+    pub fn inference(&mut self, tokens: Vec<Vec<i64>>, speed: f32) -> Result<Vec<f32>, String> {
+        //let mut session = session;
+        let mut session = self.session.lock().unwrap();
+
+        // Prepare tokens tensor
+        let tokens_shape = [tokens.len(), tokens[0].len()];
+        let tokens_flat: Vec<i64> = tokens.into_iter().flatten().collect();
+        let num_tokens = tokens_flat.len() - 2;
+        println!("tokens: {:?}", &tokens_flat);
+
+        let tokens_tensor = Tensor::from_array((tokens_shape, tokens_flat))
+            .map_err(|e| format!("Failed to create tokens tensor: {}", e))?;
+
+        let style = self.voice_styles[num_tokens].clone();
+        let style_shape = [1, style.len()];
+        let style_tensor = Tensor::from_array((style_shape, style))
+            .map_err(|e| format!("Failed to create style tensor: {}", e))?;
+
+        // Prepare speed tensor
+        let speed_tensor = Tensor::from_array(([1], vec![speed]))
+            .map_err(|e| format!("Failed to create speed tensor: {}", e))?;
+
+        // Create inputs
+        use std::borrow::Cow;
+        let inputs = SessionInputs::from(vec![
+            (Cow::Borrowed("tokens"), SessionInputValue::Owned(Value::from(tokens_tensor))),
+            (Cow::Borrowed("style"), SessionInputValue::Owned(Value::from(style_tensor))),
+            (Cow::Borrowed("speed"), SessionInputValue::Owned(Value::from(speed_tensor))),
+        ]);
+
+        // Run inference
+        let outputs = session.run(inputs)
+            .map_err(|e| format!("Failed to run inference: {}", e))?;
+
+        // Extract audio
+        let (_shape, data) = outputs["audio"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| format!("Failed to extract audio tensor: {}", e))?;
+
+        Ok(data.to_vec())
+    }
+}
+
 /// Main TTS engine struct
 pub struct TtsEngine {
-    sessions: Vec<Arc<Mutex<Session>>>,
-    voices: HashMap<String, Vec<Vec<f32>>>,
+    sessions: Vec<SessionHandler>,
     phonemizer: Phonemizer
 }
 
 impl TtsEngine {
     /// Create a new TTS engine, downloading model files if necessary
     /// Uses ~/.cache/kokoros for shared model storage
-    pub async fn new() -> Result<Self, String> {
+    pub async fn new(voice: &str) -> Result<Self, String> {
         let cache_dir = get_cache_dir();
         let model_path = cache_dir.join("kokoro-v1.0.onnx");
         let voices_path = cache_dir.join("voices-v1.0.bin");
 
         Self::with_paths(
             model_path.to_str().unwrap_or("kokoro-v1.0.onnx"),
-            voices_path.to_str().unwrap_or("voices-v1.0.bin")
+            voices_path.to_str().unwrap_or("voices-v1.0.bin"),
+            voice
         ).await
     }
 
-    fn create_sessions(model_path: &str) -> Vec<Arc<Mutex<Session>>> {
+    fn create_sessions(model_path: &str, voices_path: &str, voice: &str) -> Vec<SessionHandler> {
+        // Load voices
+        let voices = load_voices(voices_path)
+            .map_err(|e| format!("Failed to load voices: {}", e)).unwrap();
+
+        let voice = &voices[voice];
+
         // Load ONNX model
         let model_bytes = std::fs::read(model_path)
             .map_err(|e| format!("Failed to read model file: {}", e)).unwrap();
@@ -250,20 +315,7 @@ impl TtsEngine {
 
         if let Ok(session) = Session::builder()
             .map_err(|e| format!("Failed to create session builder: {}", e)).unwrap()
-            .with_execution_providers([ROCmExecutionProvider::default().build()])
-            .map_err(|e| format!("Failed to set rocm: {}", e)).unwrap()
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| format!("Failed to set optimization level: {}", e)).unwrap()
-            .with_intra_threads(std::thread::available_parallelism().unwrap().get() - 1)
-            .map_err(|e| format!("Failed to set intra threads: {}", e)).unwrap()
-            .commit_from_memory(&model_bytes)
-            .map_err(|e| format!("Failed to load model: {}", e)) {
-                sessions.push(Arc::new(Mutex::new(session)));
-            }
-
-        if let Ok(session) = Session::builder()
-            .map_err(|e| format!("Failed to create session builder: {}", e)).unwrap()
-            .with_execution_providers([CUDAExecutionProvider::default().build()])
+            .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])
             .map_err(|e| format!("Failed to set cuda: {}", e)).unwrap()
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| format!("Failed to set optimization level: {}", e)).unwrap()
@@ -271,8 +323,21 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to set intra threads: {}", e)).unwrap()
             .commit_from_memory(&model_bytes)
             .map_err(|e| format!("Failed to load model: {}", e)) {
-                sessions.push(Arc::new(Mutex::new(session)));
+                sessions.push(SessionHandler::new(Arc::new(Mutex::new(session)), voice.clone()));
             }
+
+        // if let Ok(session) = Session::builder()
+        //     .map_err(|e| format!("Failed to create session builder: {}", e)).unwrap()
+        //     .with_execution_providers([ROCmExecutionProvider::default().build()])
+        //     .map_err(|e| format!("Failed to set rocm: {}", e)).unwrap()
+        //     .with_optimization_level(GraphOptimizationLevel::Level3)
+        //     .map_err(|e| format!("Failed to set optimization level: {}", e)).unwrap()
+        //     .with_intra_threads(std::thread::available_parallelism().unwrap().get() - 1)
+        //     .map_err(|e| format!("Failed to set intra threads: {}", e)).unwrap()
+        //     .commit_from_memory(&model_bytes)
+        //     .map_err(|e| format!("Failed to load model: {}", e)) {
+        //         sessions.push(SessionHandler::new(Arc::new(Mutex::new(session)), voice.clone()));
+        //     }
 
         if let Ok(session) = Session::builder()
             .map_err(|e| format!("Failed to create session builder: {}", e)).unwrap()
@@ -284,7 +349,7 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to set intra threads: {}", e)).unwrap()
             .commit_from_memory(&model_bytes)
             .map_err(|e| format!("Failed to load model: {}", e)) {
-                sessions.push(Arc::new(Mutex::new(session)));
+                sessions.push(SessionHandler::new(Arc::new(Mutex::new(session)), voice.clone()));
             }
 
 
@@ -292,7 +357,7 @@ impl TtsEngine {
     }
 
     /// Create a new TTS engine with custom model paths
-    pub async fn with_paths(model_path: &str, voices_path: &str) -> Result<Self, String> {
+    pub async fn with_paths(model_path: &str, voices_path: &str, voice: &str) -> Result<Self, String> {
         // Ensure cache directory exists
         if let Some(parent) = Path::new(model_path).parent() {
             fs::create_dir_all(parent)
@@ -311,30 +376,27 @@ impl TtsEngine {
                 .map_err(|e| format!("Failed to download voices: {}", e))?;
         }
 
-        let sessions = Self::create_sessions(&model_path);
-
-        // Load voices
-        let voices = load_voices(voices_path)
-            .map_err(|e| format!("Failed to load voices: {}", e))?;
+        let sessions = Self::create_sessions(&model_path, voices_path, voice);
 
         Ok(Self {
             sessions,
-            voices,
             phonemizer: Phonemizer::new()
         })
     }
 
     /// Synthesize speech from text
-    pub fn synthesize_async(&mut self, texts: &Vec<&str>, voice: Option<&str>) -> Vec<Vec<f32>> {
+    pub fn synthesize_async(&mut self, texts: &Vec<&str>) -> Vec<Vec<f32>> {
+        let pool = ThreadPool::new(self.sessions.len());
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        let voice = voice.unwrap_or(DEFAULT_VOICE);
+        let mut temp_audios: Vec<Vec<Vec<f32>>> = Vec::new();
 
-        let mut audios = Vec::new();
+        let mut i = 0;
+        let mut j = 0;
 
         for text in texts {
-            let mut audio: Vec<f32> = Vec::new();
-
             //let replaced_clauses = text.replace(";", "\n");
+            temp_audios.push(Vec::new());
 
             let mut sentences: VecDeque<(&str, VecDeque<Vec<i64>>)> = text
                 .lines()
@@ -345,9 +407,8 @@ impl TtsEngine {
 
             let mut to_infer: Vec<i64> = Vec::new();
 
-
             while sentences.len() > 0 && sentences[0].1.len() > 0 {
-                if (to_infer.len() + sentences[0].1[0].len()) < 509 {
+                if (to_infer.len() + sentences[0].1[0].len()) <=509 {
                     to_infer.extend(sentences[0].1.pop_front().unwrap());
                     if sentences[0].1.len() == 0 {
                         sentences.pop_front();
@@ -358,13 +419,66 @@ impl TtsEngine {
 
                 if to_infer.len() == 0 {
                     panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
-                } else {
-                    //audio.extend(self.infer(vec![to_infer], voice, DEFAULT_SPEED).unwrap());
-                    to_infer = Vec::new();
+                }
+            
+                temp_audios[j].push(Vec::new());
+
+                let mut session: SessionHandler = self.sessions.pop().unwrap();
+                let tx = tx.clone();
+                pool.execute(move|| {
+                    to_infer.insert(0, 0);
+                    to_infer.push(0);
+                    let audio = session.inference(vec![to_infer], DEFAULT_SPEED).unwrap();
+                    tx.send((j, i, audio, session)).expect("channel will be there waiting for the pool");
+                });
+
+                to_infer = Vec::new();
+
+                if self.sessions.len() == 0 {
+                    let (t_j, t_i, t_audio, session)  = rx.iter().take(1).next().unwrap();
+                    temp_audios[t_j][t_i] = t_audio;
+                    self.sessions.push(session);
+                }
+
+                i += 1;
+            }
+
+            if to_infer.len() > 0 {
+                if to_infer.len() == 0 {
+                    panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
+                }
+            
+                temp_audios[j].push(Vec::new());
+
+                let mut session: SessionHandler = self.sessions.pop().unwrap();
+                let tx = tx.clone();
+                pool.execute(move|| {
+                    to_infer.insert(0, 0);
+                    to_infer.push(0);
+                    let audio = session.inference(vec![to_infer], DEFAULT_SPEED).unwrap();
+                    tx.send((j, i, audio, session)).expect("channel will be there waiting for the pool");
+                });
+
+                to_infer = Vec::new();
+
+                if self.sessions.len() == 0 {
+                    let (t_j, t_i, t_audio, session)  = rx.iter().take(1).next().unwrap();
+                    temp_audios[t_j][t_i] = t_audio;
+                    self.sessions.push(session);
                 }
             }
 
-            //audios.push(audio);
+            i = 0;
+            j += 1;
+        }
+
+        let mut audios = Vec::new();
+
+        for audio in temp_audios {
+            let to_copy: Vec<&f32> = audio.iter().flatten().collect();
+            let mut destination = Vec::with_capacity(to_copy.len());
+            destination.extend(to_copy);
+            audios.push(destination);
         }
 
         return audios;
@@ -495,11 +609,6 @@ impl TtsEngine {
         }
 
         Ok(buffer)
-    }
-
-    /// List available voices
-    pub fn voices(&self) -> Vec<String> {
-        self.voices.keys().cloned().collect()
     }
 
     /// Save audio to WAV file
@@ -682,55 +791,6 @@ impl TtsEngine {
             _ => Err(format!("Unsupported audio format: {}", extension))
         }
     }
-
-    // Internal methods
-
-    //fn infer(&mut self, session: std::sync::MutexGuard<'_, Session>, tokens: Vec<Vec<i64>>, voice: &str, speed: f32) -> Result<Vec<f32>, String> {
-    fn infer(&mut self, tokens: Vec<Vec<i64>>, voice: &str, speed: f32) -> Result<Vec<f32>, String> {
-        //let mut session = session;
-        let mut session = self.sessions[0].lock().unwrap();
-
-        // Prepare tokens tensor
-        let tokens_shape = [tokens.len(), tokens[0].len()];
-        let tokens_flat: Vec<i64> = tokens.into_iter().flatten().collect();
-        let num_tokens = tokens_flat.len();
-        println!("tokens: {:?}", &tokens_flat);
-
-        let tokens_tensor = Tensor::from_array((tokens_shape, tokens_flat))
-            .map_err(|e| format!("Failed to create tokens tensor: {}", e))?;
-
-        // Prepare style tensor
-        let voice = self.voices.get(voice)
-            .ok_or_else(|| format!("Voice '{}' not found", voice))?;
-
-        let style = voice[num_tokens].clone();
-        let style_shape = [1, style.len()];
-        let style_tensor = Tensor::from_array((style_shape, style))
-            .map_err(|e| format!("Failed to create style tensor: {}", e))?;
-
-        // Prepare speed tensor
-        let speed_tensor = Tensor::from_array(([1], vec![speed]))
-            .map_err(|e| format!("Failed to create speed tensor: {}", e))?;
-
-        // Create inputs
-        use std::borrow::Cow;
-        let inputs = SessionInputs::from(vec![
-            (Cow::Borrowed("tokens"), SessionInputValue::Owned(Value::from(tokens_tensor))),
-            (Cow::Borrowed("style"), SessionInputValue::Owned(Value::from(style_tensor))),
-            (Cow::Borrowed("speed"), SessionInputValue::Owned(Value::from(speed_tensor))),
-        ]);
-
-        // Run inference
-        let outputs = session.run(inputs)
-            .map_err(|e| format!("Failed to run inference: {}", e))?;
-
-        // Extract audio
-        let (_shape, data) = outputs["audio"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| format!("Failed to extract audio tensor: {}", e))?;
-
-        Ok(data.to_vec())
-    }
 }
 
 // Helper functions
@@ -749,134 +809,6 @@ fn build_vocab() -> HashMap<char, i64> {
         .enumerate()
         .map(|(idx, c)| (c, idx as i64))
         .collect();
-
-//    let mut temp: Vec<(char, i64)> = ret
-//        .iter()
-//        .map(|(character, index)| (*character, *index))
-//        .collect();
-//
-//    temp.sort_by_key(|(_character, index)| *index);
-//
-//    for (character, index) in temp {
-//        println!("\t\"{}\":{}", character, index);
-//    }
-
-    // let ret: HashMap<char, i64> = HashMap::from([
-    //     (';', 1),
-    //     (':', 2),
-    //     (',', 3),
-    //     ('.', 4),
-    //     ('!', 5),
-    //     ('?', 6),
-    //     ('—', 9),
-    //     ('…', 10),
-    //     ('\"', 11),
-    //     ('(', 12),
-    //     (')', 13),
-    //     ('“', 14),
-    //     ('”', 15),
-    //     (' ', 16),
-    //     ('\u{0303}', 17),
-    //     ('ʣ', 18),
-    //     ('ʥ', 19),
-    //     ('ʦ', 20),
-    //     ('ʨ', 21),
-    //     ('ᵝ', 22),
-    //     ('\u{AB67}', 23),
-    //     ('A', 24),
-    //     ('I', 25),
-    //     ('O', 31),
-    //     ('Q', 33),
-    //     ('S', 35),
-    //     ('T', 36),
-    //     ('W', 39),
-    //     ('Y', 41),
-    //     ('ᵊ', 42),
-    //     ('a', 43),
-    //     ('b', 44),
-    //     ('c', 45),
-    //     ('d', 46),
-    //     ('e', 47),
-    //     ('f', 48),
-    //     ('h', 50),
-    //     ('i', 51),
-    //     ('j', 52),
-    //     ('k', 53),
-    //     ('l', 54),
-    //     ('m', 55),
-    //     ('n', 56),
-    //     ('o', 57),
-    //     ('p', 58),
-    //     ('q', 59),
-    //     ('r', 60),
-    //     ('s', 61),
-    //     ('t', 62),
-    //     ('u', 63),
-    //     ('v', 64),
-    //     ('w', 65),
-    //     ('x', 66),
-    //     ('y', 67),
-    //     ('z', 68),
-    //     ('ɑ', 69),
-    //     ('ɐ', 70),
-    //     ('ɒ', 71),
-    //     ('æ', 72),
-    //     ('β', 75),
-    //     ('ɔ', 76),
-    //     ('ɕ', 77),
-    //     ('ç', 78),
-    //     ('ɖ', 80),
-    //     ('ð', 81),
-    //     ('ʤ', 82),
-    //     ('ə', 83),
-    //     ('ɚ', 85),
-    //     ('ɛ', 86),
-    //     ('ɜ', 87),
-    //     ('ɟ', 90),
-    //     ('ɡ', 92),
-    //     ('ɥ', 99),
-    //     ('ɨ', 101),
-    //     ('ɪ', 102),
-    //     ('ʝ', 103),
-    //     ('ɯ', 110),
-    //     ('ɰ', 111),
-    //     ('ŋ', 112),
-    //     ('ɳ', 113),
-    //     ('ɲ', 114),
-    //     ('ɴ', 115),
-    //     ('ø', 116),
-    //     ('ɸ', 118),
-    //     ('θ', 119),
-    //     ('œ', 120),
-    //     ('ɹ', 123),
-    //     ('ɾ', 125),
-    //     ('ɻ', 126),
-    //     ('ʁ', 128),
-    //     ('ɽ', 129),
-    //     ('ʂ', 130),
-    //     ('ʃ', 131),
-    //     ('ʈ', 132),
-    //     ('ʧ', 133),
-    //     ('ʊ', 135),
-    //     ('ʋ', 136),
-    //     ('ʌ', 138),
-    //     ('ɣ', 139),
-    //     ('ɤ', 140),
-    //     ('χ', 142),
-    //     ('ʎ', 143),
-    //     ('ʒ', 147),
-    //     ('ʔ', 148),
-    //     ('ˈ', 156),
-    //     ('ˌ', 157),
-    //     ('ː', 158),
-    //     ('ʰ', 162),
-    //     ('ʲ', 164),
-    //     ('↓', 169),
-    //     ('→', 171),
-    //     ('↗', 172),
-    //     ('↘', 173),
-    //     ('ᵻ', 177)
-    // ]);
 
     ret
 }
@@ -954,9 +886,9 @@ impl TtsBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<TtsEngine, String> {
-        TtsEngine::with_paths(&self.model_path, &self.voices_path).await
-    }
+    //pub async fn build(self) -> Result<TtsEngine, String> {
+    //    TtsEngine::with_paths(&self.model_path, &self.voices_path).await
+    //}
 }
 
 #[cfg(test)]
