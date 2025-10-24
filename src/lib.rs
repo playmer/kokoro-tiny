@@ -392,7 +392,7 @@ impl TtsEngine {
         audios_destination: Arc<Mutex<Vec<(usize, Vec<Vec<f32>>)>>>,
         session: SessionHandler, 
         finished_queueing: Arc<AtomicBool>) -> SessionHandler {
-        let mut audios_destination = audios_destination;
+        let audios_destination = audios_destination;
         let mut session = session;
 
         let mut item: Option<(usize, usize, Vec<i64>)> = inference_queue.pop();
