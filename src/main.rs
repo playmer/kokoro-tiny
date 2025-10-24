@@ -108,17 +108,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Initialize TTS engine (uses ~/.cache/kokoros automatically)
-    let mut engine = rt.block_on(TtsEngine::new())
+    let mut engine = rt.block_on(TtsEngine::new("am_michael"))
         .map_err(|e| format!("Failed to initialize TTS: {}", e))?;
 
     // List voices if requested
-    if cli.list_voices {
-        println!("🎤 Available voices:");
-        for voice in engine.voices() {
-            println!("  • {}", voice);
-        }
-        return Ok(());
-    }
+    //if cli.list_voices {
+    //    println!("🎤 Available voices:");
+    //    for voice in engine.voices() {
+    //        println!("  • {}", voice);
+    //    }
+    //    return Ok(());
+    //}
 
     // Get text to speak based on command
     //let (text, voice) = match cli.command {
@@ -171,15 +171,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let voice = "am_michael".to_string();
     let text = "Gimme a break! I wasn’t trying to be funny, and come on, that sometimes was unnecessary.".to_string();
+    let text : &str = &text;
 
     let output_path = cli.output;
     //let output_path = Some("output.wav".to_string());
 
     // Synthesize speech
-    let audio = engine.synthesize(&text, Some(&voice))
-        .map_err(|e| format!("Synthesis failed: {}", e))?;
+    let audio = engine.synthesize_async(&vec![text]);
 
     // Output to file or play
+    /*
     if let Some(output_path) = output_path {
         engine.save_wav(&output_path, &audio)
             .map_err(|e| format!("Failed to save audio: {}", e))?;
@@ -209,6 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("💾 Audio saved to: {} (playback feature not enabled)", temp_file);
         }
     }
-
+    */
+    
     Ok(())
 }

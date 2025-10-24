@@ -20,7 +20,6 @@
 //! }
 //! ```
 
-use std::clone;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
@@ -28,14 +27,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 
-use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ROCmExecutionProvider};
-use ort::value::TensorValueType;
-use threadpool::ThreadPool;
+use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
 use unicode_segmentation::UnicodeSegmentation;
-use espeak_rs::{text_to_phonemes, _text_to_phonemes};
+use espeak_rs::_text_to_phonemes;
 use ndarray::{ArrayBase, IxDyn, OwnedRepr};
 use ndarray_npy::NpzReader;
 use ort::{
@@ -44,14 +40,14 @@ use ort::{
 };
 
 #[cfg(feature = "playback")]
-use rodio::{Decoder, OutputStream, Sink, Source};
+use rodio::{Decoder, OutputStream, Sink};
 use std::io::Cursor;
 
 // Constants
 const MODEL_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx";
 const VOICES_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin";
 const SAMPLE_RATE: u32 = 24000;
-const DEFAULT_VOICE: &str = "af_sky";
+//const DEFAULT_VOICE: &str = "af_sky";
 const DEFAULT_SPEED: f32 = 1.0;
 
 // Get cache directory for shared model storage (Hue's suggestion!)
@@ -67,6 +63,7 @@ pub struct Phonemizer {
     vocab: HashMap<char, i64>,
 }
 
+/*
 struct OffsetAndSize {
     offset: usize,
     size: usize
@@ -77,7 +74,10 @@ enum WordOrNonWord {
     NonWord(OffsetAndSize),
 }
 
+*/
+
 impl Phonemizer {
+    /*
     fn get_whitespace_and_words(text: &str) -> Vec<WordOrNonWord> {
         let mut tokens = Vec::new();
 
@@ -97,6 +97,7 @@ impl Phonemizer {
 
         return tokens;
     }
+     */
 
 
     pub fn new() -> Phonemizer {
@@ -133,7 +134,7 @@ impl Phonemizer {
     }
 
     
-    pub fn graphemes_to_phonemes(&self, text: &str, use_espeak: bool) -> VecDeque<Vec<i64>>  {
+    pub fn graphemes_to_phonemes(&self, text: &str, _use_espeak: bool) -> VecDeque<Vec<i64>>  {
         let mut phonemes = Vec::new();
 
         phonemes.push(_text_to_phonemes(text.trim(), "en-us", None, true, false).unwrap().join(""));
@@ -322,8 +323,6 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to set cuda: {}", e)).unwrap()
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| format!("Failed to set optimization level: {}", e)).unwrap()
-            .with_intra_threads(std::thread::available_parallelism().unwrap().get() - 1)
-            .map_err(|e| format!("Failed to set intra threads: {}", e)).unwrap()
             .commit_from_memory(&model_bytes)
             .map_err(|e| format!("Failed to load model: {}", e)) {
                 sessions.push(SessionHandler::new(Arc::new(Mutex::new(session)), voice.clone()));
@@ -348,8 +347,6 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to set cuda: {}", e)).unwrap()
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| format!("Failed to set optimization level: {}", e)).unwrap()
-            .with_intra_threads(std::thread::available_parallelism().unwrap().get() - 1)
-            .map_err(|e| format!("Failed to set intra threads: {}", e)).unwrap()
             .commit_from_memory(&model_bytes)
             .map_err(|e| format!("Failed to load model: {}", e)) {
                 sessions.push(SessionHandler::new(Arc::new(Mutex::new(session)), voice.clone()));
@@ -397,10 +394,11 @@ impl TtsEngine {
 
         let mut item: Option<(usize, usize, Vec<i64>)> = inference_queue.pop();
         
-        while item.is_some() || finished_queueing.load(std::sync::atomic::Ordering::Relaxed) {
+        while item.is_some() || !finished_queueing.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some((j, i, to_infer)) = item {
                 let audio = session.inference(vec![to_infer], DEFAULT_SPEED).unwrap();
 
+                println!("({j}, {i})");
                 let mut destination = audios_destination.lock().unwrap();
                 let (complete_infrences, section_audio) = &mut destination[j];
                 section_audio[i] = audio;
@@ -472,6 +470,7 @@ impl TtsEngine {
                     {
                         to_infer.insert(0, 0);
                         to_infer.push(0);
+                        inference_queue.push((j, i, to_infer));
                     }
                     
                     to_infer = Vec::new();
@@ -491,9 +490,8 @@ impl TtsEngine {
                     {
                         to_infer.insert(0, 0);
                         to_infer.push(0);
+                        inference_queue.push((j, i, to_infer));
                     }
-                    
-                    to_infer = Vec::new();
                 }
 
                 i = 0;
@@ -526,6 +524,8 @@ impl TtsEngine {
                 generated_audios[i].1.clear();
                 copied_audio = true
             }
+
+            self.save_wav(&format!("audio_{i}.wav"), &audios.last().unwrap()).unwrap();
         }
 
         for thread in handles {
