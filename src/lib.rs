@@ -20,13 +20,16 @@
 //! }
 //! ```
 
+use std::clone;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender};
+use std::time::Duration;
 
 use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ROCmExecutionProvider};
 use ort::value::TensorValueType;
@@ -384,101 +387,149 @@ impl TtsEngine {
         })
     }
 
-    /// Synthesize speech from text
-    pub fn synthesize_async(&mut self, texts: &Vec<&str>) -> Vec<Vec<f32>> {
-        let pool = ThreadPool::new(self.sessions.len());
-        let (tx, rx) = std::sync::mpsc::channel();
+    fn infer_thread (
+        inference_queue: Arc<lockfree::queue::Queue<(usize, usize, Vec<i64>)>>,
+        audios_destination: Arc<Mutex<Vec<(usize, Vec<Vec<f32>>)>>>,
+        session: SessionHandler, 
+        finished_queueing: Arc<AtomicBool>) -> SessionHandler {
+        let mut audios_destination = audios_destination;
+        let mut session = session;
 
-        let mut temp_audios: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut item: Option<(usize, usize, Vec<i64>)> = inference_queue.pop();
+        
+        while item.is_some() || finished_queueing.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some((j, i, to_infer)) = item {
+                let audio = session.inference(vec![to_infer], DEFAULT_SPEED).unwrap();
 
-        let mut i = 0;
-        let mut j = 0;
-
-        for text in texts {
-            //let replaced_clauses = text.replace(";", "\n");
-            temp_audios.push(Vec::new());
-
-            let mut sentences: VecDeque<(&str, VecDeque<Vec<i64>>)> = text
-                .lines()
-                .map(|f| f.unicode_sentences())
-                .flatten()
-                .map(|t| (t, self.phonemizer.graphemes_to_phonemes(t, true)))
-                .collect();
-
-            let mut to_infer: Vec<i64> = Vec::new();
-
-            while sentences.len() > 0 && sentences[0].1.len() > 0 {
-                if (to_infer.len() + sentences[0].1[0].len()) <=509 {
-                    to_infer.extend(sentences[0].1.pop_front().unwrap());
-                    if sentences[0].1.len() == 0 {
-                        sentences.pop_front();
-                    }
-
-                    continue;
-                }
-
-                if to_infer.len() == 0 {
-                    panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
-                }
-            
-                temp_audios[j].push(Vec::new());
-
-                let mut session: SessionHandler = self.sessions.pop().unwrap();
-                let tx = tx.clone();
-                pool.execute(move|| {
-                    to_infer.insert(0, 0);
-                    to_infer.push(0);
-                    let audio = session.inference(vec![to_infer], DEFAULT_SPEED).unwrap();
-                    tx.send((j, i, audio, session)).expect("channel will be there waiting for the pool");
-                });
-
-                to_infer = Vec::new();
-
-                if self.sessions.len() == 0 {
-                    let (t_j, t_i, t_audio, session)  = rx.iter().take(1).next().unwrap();
-                    temp_audios[t_j][t_i] = t_audio;
-                    self.sessions.push(session);
-                }
-
-                i += 1;
+                let mut destination = audios_destination.lock().unwrap();
+                let (complete_infrences, section_audio) = &mut destination[j];
+                section_audio[i] = audio;
+                *complete_infrences += 1;
             }
-
-            if to_infer.len() > 0 {
-                if to_infer.len() == 0 {
-                    panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
-                }
             
-                temp_audios[j].push(Vec::new());
-
-                let mut session: SessionHandler = self.sessions.pop().unwrap();
-                let tx = tx.clone();
-                pool.execute(move|| {
-                    to_infer.insert(0, 0);
-                    to_infer.push(0);
-                    let audio = session.inference(vec![to_infer], DEFAULT_SPEED).unwrap();
-                    tx.send((j, i, audio, session)).expect("channel will be there waiting for the pool");
-                });
-
-                to_infer = Vec::new();
-
-                if self.sessions.len() == 0 {
-                    let (t_j, t_i, t_audio, session)  = rx.iter().take(1).next().unwrap();
-                    temp_audios[t_j][t_i] = t_audio;
-                    self.sessions.push(session);
-                }
-            }
-
-            i = 0;
-            j += 1;
+            item = inference_queue.pop();
         }
 
+        return session;
+    }
+
+    /// Synthesize speech from text
+    pub fn synthesize_async(&mut self, texts: &Vec<&str>) -> Vec<Vec<f32>> {
+        let inference_queue: Arc<lockfree::queue::Queue<(usize, usize, Vec<i64>)>> = Arc::new(lockfree::queue::Queue::new());
+        let audios_destination: Arc<Mutex<Vec<(usize, Vec<Vec<f32>>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let finished_queueing: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+
+        for _ in 0..self.sessions.len()  {
+            let audios_destination = audios_destination.clone();
+            let queue = inference_queue.clone();
+            let session = self.sessions.pop().unwrap();
+            let finished_queueing = finished_queueing.clone();
+            handles.push(std::thread::spawn(move || {
+                return Self::infer_thread(queue, audios_destination, session, finished_queueing);
+            }));
+        }
+
+        {
+            let mut i = 0;
+            let mut j = 0;
+
+            for text in texts {
+                {
+                    let mut destination = audios_destination.lock().unwrap();
+                    destination.push((0, Vec::new()));
+                }
+
+                let mut sentences: VecDeque<(&str, VecDeque<Vec<i64>>)> = text
+                    .lines()
+                    .map(|f| f.unicode_sentences())
+                    .flatten()
+                    .map(|t| (t, self.phonemizer.graphemes_to_phonemes(t, true)))
+                    .collect();
+
+                let mut to_infer: Vec<i64> = Vec::new();
+
+                while sentences.len() > 0 && sentences[0].1.len() > 0 {
+                    if (to_infer.len() + sentences[0].1[0].len()) <=509 {
+                        to_infer.extend(sentences[0].1.pop_front().unwrap());
+                        if sentences[0].1.len() == 0 {
+                            sentences.pop_front();
+                        }
+
+                        continue;
+                    }
+
+                    if to_infer.len() == 0 {
+                        panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
+                    }
+                    
+                    {
+                        let mut destination = audios_destination.lock().unwrap();
+                        destination[j].1.push(Vec::new());
+                    }
+
+                    {
+                        to_infer.insert(0, 0);
+                        to_infer.push(0);
+                    }
+                    
+                    to_infer = Vec::new();
+                    i += 1;
+                }
+
+                if to_infer.len() > 0 {
+                    if to_infer.len() == 0 {
+                        panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
+                    }
+                
+                    {
+                        let mut destination = audios_destination.lock().unwrap();
+                        destination[j].1.push(Vec::new());
+                    }
+
+                    {
+                        to_infer.insert(0, 0);
+                        to_infer.push(0);
+                    }
+                    
+                    to_infer = Vec::new();
+                }
+
+                i = 0;
+                j += 1;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        finished_queueing.store(true, std::sync::atomic::Ordering::SeqCst);
+        
         let mut audios = Vec::new();
 
-        for audio in temp_audios {
-            let to_copy: Vec<&f32> = audio.iter().flatten().collect();
-            let mut destination = Vec::with_capacity(to_copy.len());
-            destination.extend(to_copy);
-            audios.push(destination);
+        for i in 0..texts.len() {
+            std::thread::sleep(Duration::from_millis(1000));
+            let mut copied_audio = false;
+
+            while !copied_audio {
+                let generated_audios = audios_destination.clone();
+                let mut generated_audios = generated_audios.lock().unwrap();
+
+                if generated_audios[i].0 != generated_audios[i].1.len() {
+                    continue;
+                }
+                
+                let to_copy: Vec<&f32> = generated_audios[i].1.iter().flatten().collect();
+                let mut destination = Vec::with_capacity(to_copy.len());
+                destination.extend(to_copy);
+                audios.push(destination);
+                generated_audios[i].1.clear();
+                copied_audio = true
+            }
+        }
+
+        for thread in handles {
+            self.sessions.push(thread.join().unwrap());
         }
 
         return audios;

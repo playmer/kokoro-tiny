@@ -13,3 +13,4 @@ voices-v1.0.bin
 .env.local
 
 .vs/
+.cache/

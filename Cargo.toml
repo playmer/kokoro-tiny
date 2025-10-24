@@ -48,6 +48,7 @@ cpal = { version = "0.15", optional = true }
 rodio = { version = "0.19", optional = true }
 audiopus = { version = "0.2", optional = true }
 threadpool = "1.8.1"
+lockfree = "0.5.1"
 
 [features]
 default = ["playback"]
