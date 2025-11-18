@@ -20,6 +20,7 @@
 //! }
 //! ```
 
+use core::panic;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
@@ -30,9 +31,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
+use tracing::instrument;
 use unicode_segmentation::UnicodeSegmentation;
 use espeak_rs::_text_to_phonemes;
-use ndarray::{ArrayBase, IxDyn, OwnedRepr};
+use ndarray::{ArrayBase, ArrayView, Dim, IxDyn, OwnedRepr, ViewRepr};
 use ndarray_npy::NpzReader;
 use ort::{
     session::{builder::GraphOptimizationLevel, Session, SessionInputs, SessionInputValue},
@@ -134,11 +136,39 @@ impl Phonemizer {
     }
 
     
-    pub fn graphemes_to_phonemes(&self, text: &str, _use_espeak: bool) -> VecDeque<Vec<i64>>  {
-        let mut phonemes = Vec::new();
+    pub fn graphemes_to_phonemes<'a>(&self, text: &'a str, _use_espeak: bool) -> Option<(&'a str, VecDeque<Vec<i64>>)>  {
+        let mut phonemes: Vec<String> = text
+            .unicode_sentences()
+            .map(|s| _text_to_phonemes(s.trim(), "en-us", None, true, false)
+            .unwrap()
+            .join(""))
+            .collect();
 
-        phonemes.push(_text_to_phonemes(text.trim(), "en-us", None, true, false).unwrap().join(""));
+        if phonemes.len() == 0 {
+            println!("Warning: Empty Text: {text}");
+            return None
+        }
 
+        // First a combining step.
+        if phonemes.len() > 1
+        {
+            let mut sentences = phonemes.len();
+            let mut i = 0;
+
+            while i < (sentences - 1) {
+                if (phonemes[i].len() + phonemes[i + 1].len()) <= 509 {
+                    let next = phonemes[i + 1].to_owned();
+                    phonemes[i] += &next;
+                    phonemes.remove(i + 1);
+
+                    sentences -= 1;
+                }
+            
+                i += 1;
+            }
+        }
+
+        // Now a splitting step.
         let mut i = 0;
 
         while phonemes[i].len() > 509 {
@@ -161,7 +191,13 @@ impl Phonemizer {
             i += 1;
         }
 
-        phonemes.iter().map(|f| self.tokenize_phonemes(f)).collect()
+        let tokens: Vec<_>  = phonemes.iter().map(|f| self.tokenize_phonemes(f)).collect(); 
+
+        if tokens.len() > 510 {
+            println!("Uh Oh!: \n{}", text);
+        }
+
+        Some((text, tokens.into()))
     }
 
 //pub fn graphemes_to_phonemes(&self, text: &str, use_espeak: bool) -> String  {
@@ -239,7 +275,7 @@ impl SessionHandler {
             voice_styles,
         }
     }
-
+    
     pub fn inference(&mut self, tokens: Vec<Vec<i64>>, speed: f32) -> Result<Vec<f32>, String> {
         //let mut session = session;
         let mut session = self.session.lock().unwrap();
@@ -248,7 +284,7 @@ impl SessionHandler {
         let tokens_shape = [tokens.len(), tokens[0].len()];
         let tokens_flat: Vec<i64> = tokens.into_iter().flatten().collect();
         let num_tokens = tokens_flat.len() - 2;
-        println!("tokens: {:?}", &tokens_flat);
+        //println!("tokens: {:?}", &tokens_flat);
 
         let tokens_tensor = Tensor::from_array((tokens_shape, tokens_flat))
             .map_err(|e| format!("Failed to create tokens tensor: {}", e))?;
@@ -280,6 +316,64 @@ impl SessionHandler {
             .map_err(|e| format!("Failed to extract audio tensor: {}", e))?;
 
         Ok(data.to_vec())
+    }
+}
+
+struct Chunk {
+    data: Vec<f32>
+}
+
+impl Chunk {
+    fn new() -> Chunk {
+        Chunk { data: Vec::new() }
+    }
+}
+
+struct Paragraph {
+    finished_chunks: usize,
+     // These need to be joined with internal trimming, so don't 
+     // trim the start on the first chunk, or the end on the last chunk.
+    chunks: Vec<Chunk>
+}
+
+impl Paragraph {
+    fn new() -> Paragraph {
+        Paragraph { finished_chunks: 0, chunks: Vec::new() }
+    }
+
+    fn combine_chunks(&self) -> Vec<f32> {
+        let mut data: Vec<f32> = Vec::new();
+
+        match self.chunks.len() {
+            0 => return Vec::new(),
+            1 => return self.chunks[0].data.clone(),
+            _ => {
+                for (i, chunk) in self.chunks.iter().enumerate() {
+                    let trim_type = if i == 0 {
+                        TrimSection::End
+                    } else if i == self.chunks.len() {
+                        TrimSection::Begin
+                    } else {
+                        TrimSection::BeginAndEnd
+                    };
+                    
+                    data.extend(trim_with_auto_ref(&chunk.data, trim_type, 60.0, 2048, 512).unwrap());
+                }
+            }
+        }
+
+        data
+    }
+}
+
+struct Section {
+    finished_paragraphs: usize,
+    paragraphs: Vec<Paragraph> // These can be cleanly joined.
+}
+
+impl Section {
+    fn new() -> Section {
+        Section { finished_paragraphs: 0, paragraphs: Vec::new() }
     }
 }
 
@@ -323,6 +417,8 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to set cuda: {}", e)).unwrap()
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| format!("Failed to set optimization level: {}", e)).unwrap()
+            //.with_profiling("cuda_profiling.json")
+            //.map_err(|e| format!("Failed to set profiling file: {}", e)).unwrap()
             .commit_from_memory(&model_bytes)
             .map_err(|e| format!("Failed to load model: {}", e)) {
                 sessions.push(SessionHandler::new(Arc::new(Mutex::new(session)), voice.clone()));
@@ -347,6 +443,8 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to set cuda: {}", e)).unwrap()
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| format!("Failed to set optimization level: {}", e)).unwrap()
+            //.with_profiling("cpu_profiling.json")
+            //.map_err(|e| format!("Failed to set profiling file: {}", e)).unwrap()
             .commit_from_memory(&model_bytes)
             .map_err(|e| format!("Failed to load model: {}", e)) {
                 sessions.push(SessionHandler::new(Arc::new(Mutex::new(session)), voice.clone()));
@@ -385,36 +483,48 @@ impl TtsEngine {
     }
 
     fn infer_thread (
-        inference_queue: Arc<lockfree::queue::Queue<(usize, usize, Vec<i64>)>>,
-        audios_destination: Arc<Mutex<Vec<(usize, Vec<Vec<f32>>)>>>,
+        inference_queue: Arc<lockfree::queue::Queue<(usize, usize, usize, Vec<i64>)>>,
+        audios_destination: Arc<Mutex<Vec<Section>>>,
         session: SessionHandler, 
         finished_queueing: Arc<AtomicBool>) -> SessionHandler {
         let audios_destination = audios_destination;
         let mut session = session;
 
-        let mut item: Option<(usize, usize, Vec<i64>)> = inference_queue.pop();
+        let mut item: Option<(usize, usize, usize, Vec<i64>)> = inference_queue.pop();
         
-        while item.is_some() || !finished_queueing.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some((j, i, to_infer)) = item {
+        while !finished_queueing.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some((i, j, k, to_infer)) = item {
                 let audio = session.inference(vec![to_infer], DEFAULT_SPEED).unwrap();
 
-                println!("({j}, {i})");
+                println!("({i}, {j}, {k})");
                 let mut destination = audios_destination.lock().unwrap();
-                let (complete_infrences, section_audio) = &mut destination[j];
-                section_audio[i] = audio;
-                *complete_infrences += 1;
+                let section = &mut destination[i];
+                let paragraph = &mut section.paragraphs[j];
+                paragraph.chunks[k].data = audio;
+                paragraph.finished_chunks += 1;
+
+                if paragraph.finished_chunks == paragraph.chunks.len() {
+                    section.finished_paragraphs += 1;
+                    println!("Finished paragraph ({i}, {j})");
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(1000));
             }
             
             item = inference_queue.pop();
         }
+        
+        println!("Finished Thread");
 
         return session;
     }
 
     /// Synthesize speech from text
-    pub fn synthesize_async(&mut self, texts: &Vec<&str>) -> Vec<Vec<f32>> {
-        let inference_queue: Arc<lockfree::queue::Queue<(usize, usize, Vec<i64>)>> = Arc::new(lockfree::queue::Queue::new());
-        let audios_destination: Arc<Mutex<Vec<(usize, Vec<Vec<f32>>)>>> = Arc::new(Mutex::new(Vec::new()));
+    pub fn synthesize(&mut self, sections: &[&str]) -> Vec<Vec<f32>> {
+        let inference_queue: Arc<lockfree::queue::Queue<(usize, usize, usize, Vec<i64>)>> = Arc::new(lockfree::queue::Queue::new());
+
+        let audios_destination: Arc<Mutex<Vec<Section>>> = Arc::new(Mutex::new(Vec::new()));
+
         let finished_queueing: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
         let mut handles = Vec::new();
@@ -433,100 +543,72 @@ impl TtsEngine {
             let mut i = 0;
             let mut j = 0;
 
-            for text in texts {
+            for section in sections {
                 {
                     let mut destination = audios_destination.lock().unwrap();
-                    destination.push((0, Vec::new()));
+                    destination.push(Section::new());
                 }
 
-                let mut sentences: VecDeque<(&str, VecDeque<Vec<i64>>)> = text
+                let mut paragraphs: VecDeque<(&str, VecDeque<Vec<i64>>)> = section
                     .lines()
-                    .map(|f| f.unicode_sentences())
-                    .flatten()
-                    .map(|t| (t, self.phonemizer.graphemes_to_phonemes(t, true)))
+                    .filter_map(|t| self.phonemizer.graphemes_to_phonemes(t, true))
                     .collect();
 
-                let mut to_infer: Vec<i64> = Vec::new();
+                for paragraph in &mut paragraphs {
+                    {
+                        let mut destination = audios_destination.lock().unwrap();
+                        destination[i].paragraphs.push(Paragraph::new());
+                    }
 
-                while sentences.len() > 0 && sentences[0].1.len() > 0 {
-                    if (to_infer.len() + sentences[0].1[0].len()) <=509 {
-                        to_infer.extend(sentences[0].1.pop_front().unwrap());
-                        if sentences[0].1.len() == 0 {
-                            sentences.pop_front();
+                    for k in 0..paragraph.1.len(){
+                        {
+                            let mut destination = audios_destination.lock().unwrap();
+                            destination[i].paragraphs[j].chunks.push(Chunk::new());
                         }
 
-                        continue;
-                    }
-
-                    if to_infer.len() == 0 {
-                        panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
-                    }
-                    
-                    {
-                        let mut destination = audios_destination.lock().unwrap();
-                        destination[j].1.push(Vec::new());
-                    }
-
-                    {
-                        to_infer.insert(0, 0);
-                        to_infer.push(0);
-                        inference_queue.push((j, i, to_infer));
-                    }
-                    
-                    to_infer = Vec::new();
-                    i += 1;
-                }
-
-                if to_infer.len() > 0 {
-                    if to_infer.len() == 0 {
-                        panic!("Whoopsies, don't know how to split a really long sentence ({} tokens): {}", sentences[0].1[0].len(), &sentences[0].0);
+                        let mut chunk = paragraph.1.pop_front().unwrap();
+                        chunk.insert(0, 0);
+                        chunk.push(0);
+                        inference_queue.push((i, j, k, chunk));
                     }
                 
-                    {
-                        let mut destination = audios_destination.lock().unwrap();
-                        destination[j].1.push(Vec::new());
-                    }
-
-                    {
-                        to_infer.insert(0, 0);
-                        to_infer.push(0);
-                        inference_queue.push((j, i, to_infer));
-                    }
+                    j += 1;
                 }
 
-                i = 0;
-                j += 1;
+                j = 0;
+                i += 1;
             }
         }
 
         std::thread::sleep(Duration::from_millis(200));
-
-        finished_queueing.store(true, std::sync::atomic::Ordering::SeqCst);
         
-        let mut audios = Vec::new();
+        let mut audios: Vec<Vec<f32>> = Vec::new();
 
-        for i in 0..texts.len() {
+        for i in 0..sections.len() {
             std::thread::sleep(Duration::from_millis(1000));
             let mut copied_audio = false;
 
             while !copied_audio {
+                std::thread::sleep(Duration::from_millis(1000));
                 let generated_audios = audios_destination.clone();
                 let mut generated_audios = generated_audios.lock().unwrap();
 
-                if generated_audios[i].0 != generated_audios[i].1.len() {
+                if generated_audios[i].finished_paragraphs != generated_audios[i].paragraphs.len() {
                     continue;
                 }
-                
-                let to_copy: Vec<&f32> = generated_audios[i].1.iter().flatten().collect();
-                let mut destination = Vec::with_capacity(to_copy.len());
-                destination.extend(to_copy);
-                audios.push(destination);
-                generated_audios[i].1.clear();
+
+                audios.push(generated_audios[i].paragraphs.iter().map(|f| f.combine_chunks()).flatten().collect());
+                generated_audios[i].paragraphs.clear();
                 copied_audio = true
             }
+            
+            println!("Finished section {i}");
 
-            self.save_wav(&format!("audio_{i}.wav"), &audios.last().unwrap()).unwrap();
+            //self.save_wav(&format!("audio_{i}.wav"), &audios.last().unwrap()).unwrap();
+            std::fs::write(&format!("audio_{i}.txt"), sections[i]).unwrap();
         }
+        
+        finished_queueing.store(true, std::sync::atomic::Ordering::SeqCst);
 
         for thread in handles {
             self.sessions.push(thread.join().unwrap());
@@ -534,66 +616,6 @@ impl TtsEngine {
 
         return audios;
     }
-
-//    pub fn synthesize(&mut self, text: &str, voice: Option<&str>) -> Result<Vec<f32>, String> {
-//        let voice = voice.unwrap_or(DEFAULT_VOICE);
-//
-//        let mut audio = Vec::new();
-//
-//        //let phonemes_vec = vec!["$ɡˈɪmi ɐ bɹˈeɪk!$", "$aɪ wˈʌzn̩t tɹˈaɪɪŋ təbi fˈʌni. ænd kˈʌm ˈɔn. ðæt sˈʌmtaɪmz wʌz ʌnnˈɛsᵻsɚɹi.$"];
-//
-//        for (i, sentence) in text.unicode_sentences().enumerate() {
-//            //println!("{i}: \"{sentence}\"");
-//
-//            // Convert text to phonemes
-//            // Parameters: text, language, voice variant (None for default), preserve punctuation, with_stress
-//
-//            //let phonemes = text_to_phonemes(sentence.trim(), "en-us", None, true, false)
-//            //    .map_err(|e| format!("Failed to convert text to phonemes: {:?}", e))?;
-//
-//            // Join phonemes into a single string
-//            let mut phonemes_str = self.phonemizer.graphemes_to_phonemes(sentence, true);
-//            phonemes_str.insert(0, '$');
-//            phonemes_str.push('$');
-//            
-//            // Tokenize phonemes using proper vocabulary
-//            let tokens = self.tokenize_phonemes(&phonemes_str);
-//
-//            //let tokens = self.tokenize(&phonemes_vec[i]);
-//            
-//
-//            // Run inference
-//            // TODO: I should rearchitect this so I don't have to clone the style, and remake the style and
-//            //       speed tensors within infer every call.
-//            //let self.sessions.pop()
-//            //let session = self.sessions[0].lock().unwrap();
-//            //audio.extend(self.infer(session, tokens, voice, DEFAULT_SPEED)?);
-//            audio.extend(self.infer(tokens, voice, DEFAULT_SPEED)?);
-//        }
-//
-//        return Ok(audio);
-
-//        // Convert text to phonemes
-//        // Parameters: text, language, voice variant (None for default), preserve punctuation, with_stress
-//        let phonemes = text_to_phonemes(text, "en", None, true, true)
-//            .map_err(|e| format!("Failed to convert text to phonemes: {:?}", e))?;
-//
-//        // Join phonemes into a single string
-//        let mut phonemes_str = phonemes.join("");
-//        phonemes_str.insert(0, '$');
-//        phonemes_str.push('$');
-//        
-//        println!("phonemes [{}]: {}", phonemes.len(), phonemes_str);
-//
-//        // Tokenize phonemes using proper vocabulary
-//        let tokens = self.tokenize(&phonemes_str);
-//
-//        // Run inference
-//        let audio = self.infer(tokens, style, DEFAULT_SPEED)?;
-//
-//
-//        Ok(audio)
-//    }
 
     /// Play audio directly to the default audio device with volume control
     #[cfg(feature = "playback")]
@@ -941,6 +963,417 @@ impl TtsBuilder {
     //    TtsEngine::with_paths(&self.model_path, &self.voices_path).await
     //}
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+
+
+//def amplitude_to_db(
+//    S,
+//    *,
+//    ref: float | Callable = 1.0,
+//    amin: float = 1e-5,
+//    top_db: float | None = 80.0,
+//) -> np.floating[Any] | np.ndarray:
+fn amplitude_to_db(
+    audio: ArrayBase<ViewRepr<&f32>, Dim<[usize; 1]>>,
+    a_min: Option<f32>,
+    top_db: Option<f32>
+) -> Vec<f32> {
+    let top_db = top_db.unwrap_or(80.0);
+    let a_min = a_min.unwrap_or(1e-5);
+//    S = np.asarray(S)
+
+//    if np.issubdtype(S.dtype, np.complexfloating):
+//        warnings.warn(
+//            "amplitude_to_db was called on complex input so phase "
+//            "information will be discarded. To suppress this warning, "
+//            "call amplitude_to_db(np.abs(S)) instead.",
+//            stacklevel=2,
+//        )
+    
+
+//    magnitude = np.abs(S)
+//
+//    if callable(ref):
+//        # User supplied a function to calculate reference power
+//        ref_value = ref(magnitude)
+//    else:
+//        ref_value = np.abs(ref)
+//
+//    out_array = magnitude if isinstance(magnitude, np.ndarray) else None
+//    power = np.square(magnitude, out=out_array)
+//
+//    db: np.ndarray = power_to_db(power, ref=ref_value**2, amin=amin**2, top_db=top_db)
+//    return db
+
+    let magnitude = audio.abs();
+    let S = magnitude.iter().max();
+
+    Vec::new()
+}
+
+
+//let test = ArrayView::from(&audio);
+//let abs = test.abs();
+
+fn _signal_to_frame_nonsilent(
+    audio: ArrayBase<ViewRepr<&f32>, Dim<[usize; 1]>>,
+    frame_length: Option<i32>,
+    hop_length: Option<i32>,
+    top_db: Option<f32>
+) -> Vec<f32> {
+    let _ = audio;
+    let frame_length = frame_length.unwrap_or(2048);
+    let hop_length = hop_length.unwrap_or(512);
+    let top_db = top_db.unwrap_or(60.0);
+    //let ref_fn = ref_fn.unwrap_or(60.0);
+    //let aggregate = aggregate.unwrap_or(60.0);
+
+
+    Vec::new()
+}
+
+
+
+
+
+fn trim_audio(
+    audio: &Vec<f32>, 
+    top_db: Option<f32>,
+    //ref: float | Callable = np.max,
+    frame_length: Option<i32>,
+    hop_length: Option<i32>
+    //aggregate: Callable = np.max,
+) -> (Vec<f32>, Vec<f32>) {
+    let top_db = top_db.unwrap_or(60.0);
+    let frame_length = frame_length.unwrap_or(2048);
+    let hop_length = hop_length.unwrap_or(512);
+
+    let audio_view = ArrayView::from(&audio);
+
+    let non_silent = _signal_to_frame_nonsilent(audio_view, Some(frame_length), Some(hop_length), Some(top_db));
+
+    (Vec::new(), Vec::new())
+}
+
+ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Copyright (c) 2013--2023, librosa development team (Python original)
+// Rust port by Copilot, 2024
+//
+// ***This file extracted and adapted from librosa (Python) for use as a standalone Rust module.***
+//
+// Reference (Python):
+//     - https://gist.github.com/evq/82e95a363eeeb75d15dd62abc1eb1bde
+//     - https://github.com/librosa/librosa/blob/894942673d55aa2206df1296b6c4c50827c7f1d6/librosa/effects.py#L612
+
+use std::f32;
+use std::fmt;
+
+#[derive(Debug)]
+pub struct LibrosaError(pub String);
+
+impl fmt::Display for LibrosaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LibrosaError: {}", self.0)
+    }
+}
+
+impl std::error::Error for LibrosaError {}
+
+pub fn abs2(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|&v| v * v).collect()
+}
+
+pub fn amplitude_to_db(
+    s: &[f32],
+    ref_val: f32,
+    amin: f32,
+    top_db: Option<f32>,
+) -> Vec<f32> {
+    let magnitude: Vec<f32> = s.iter().map(|&x| x.abs()).collect();
+    let power: Vec<f32> = magnitude.iter().map(|&x| x * x).collect();
+    power_to_db(&power, ref_val * ref_val, amin * amin, top_db)
+}
+
+pub fn power_to_db(
+    s: &[f32],
+    ref_val: f32,
+    amin: f32,
+    top_db: Option<f32>,
+) -> Vec<f32> {
+    let log_spec: Vec<f32> = s
+        .iter()
+        .map(|&x| 10.0 * (x.max(amin)).log10() - 10.0 * ref_val.max(amin).log10())
+        .collect();
+
+    if let Some(top_db) = top_db {
+        let max_log = log_spec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        log_spec.iter().map(|&x| x.max(max_log - top_db)).collect()
+    } else {
+        log_spec
+    }
+}
+
+// Framing: slice a 1D array into overlapping frames
+pub fn frame(
+    x: &[f32],
+    frame_length: usize,
+    hop_length: usize,
+) -> Result<Vec<Vec<f32>>, LibrosaError> {
+    if x.len() < frame_length {
+        return Err(LibrosaError(format!(
+            "Input is too short (n={}) for frame_length={}",
+            x.len(),
+            frame_length
+        )));
+    }
+    if hop_length < 1 {
+        return Err(LibrosaError(format!("Invalid hop_length: {}", hop_length)));
+    }
+    let n_frames = 1 + (x.len() - frame_length) / hop_length;
+    let mut frames = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        let start = i * hop_length;
+        let end = start + frame_length;
+        frames.push(x[start..end].to_vec());
+    }
+    Ok(frames)
+}
+
+// RMS calculation for an audio signal (1D)
+pub fn rms(
+    y: &[f32],
+    frame_length: usize,
+    hop_length: usize,
+    center: bool,
+) -> Result<Vec<f32>, LibrosaError> {
+    let mut padded = Vec::new();
+    if center {
+        let pad = frame_length / 2;
+        padded.extend(std::iter::repeat(0.0).take(pad));
+        padded.extend_from_slice(y);
+        padded.extend(std::iter::repeat(0.0).take(pad));
+    } else {
+        padded.extend_from_slice(y);
+    }
+    let frames = frame(&padded, frame_length, hop_length)?;
+    Ok(frames
+        .iter()
+        .map(|f| {
+            let mean_sq = f.iter().map(|&x| x * x).sum::<f32>() / f.len() as f32;
+            mean_sq.sqrt()
+        })
+        .collect())
+}
+
+// Convert frame indices to sample indices
+pub fn frames_to_samples(
+    frames: &[usize],
+    hop_length: usize,
+    n_fft: Option<usize>,
+) -> Vec<usize> {
+    let offset = n_fft.map_or(0, |n| n / 2);
+    frames.iter().map(|&f| f * hop_length + offset).collect()
+}
+
+
+pub enum TrimSection {
+    BeginAndEnd,
+    Begin,
+    End
+}
+
+
+// Core trim function
+pub fn trim(
+    y: &[f32],
+    trim_type: TrimSection,
+    top_db: f32,
+    ref_val: f32,
+    frame_length: usize,
+    hop_length: usize,
+) -> Result<Vec<f32>, LibrosaError> {
+    let rms_vals = rms(y, frame_length, hop_length, true)?;
+    let db = amplitude_to_db(&rms_vals, ref_val, 1e-5, None);
+    let non_silent: Vec<bool> = db.iter().map(|&d| d > -top_db).collect();
+    let nonzero: Vec<usize> = non_silent
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &val)| if val { Some(i) } else { None })
+        .collect();
+
+    let (start, end) = if !nonzero.is_empty() {
+        let start = frames_to_samples(&[nonzero[0]], hop_length, None)[0];
+        let end = {
+            let e = frames_to_samples(&[nonzero[nonzero.len() - 1] + 1], hop_length, None)[0];
+            e.min(y.len())
+        };
+        (start, end)
+    } else {
+        (0, 0)
+    };
+
+    let (start, end) = match trim_type {
+        TrimSection::Begin => (start, y.len()),
+        TrimSection::BeginAndEnd => (start, end),
+        TrimSection::End => (0, end),
+    };
+
+
+    Ok(y[start..end].to_vec())
+}
+
+// Optional: helper for auto ref_val as max (librosa default)
+pub fn trim_with_auto_ref(
+    y: &[f32],
+    trim_type: TrimSection,
+    top_db: f32,
+    frame_length: usize,
+    hop_length: usize,
+) -> Result<Vec<f32>, LibrosaError> {
+    let ref_val = y.iter().cloned().fold(f32::NEG_INFINITY, f32::max).abs();
+    trim(y, trim_type, top_db, ref_val, frame_length, hop_length)
+}
+
+// // Tests
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+
+//     #[test]
+//     fn test_trim_simple() {
+//         // Silence, then tone, then silence
+//         let mut y = vec![0.0; 100];
+//         y.extend(vec![1.0; 500]);
+//         y.extend(vec![0.0; 100]);
+//         let (y_trimmed, idx) = trim_with_auto_ref(
+//             &y,
+//             60.0,
+//             2048,
+//             512
+//         ).unwrap();
+//         assert!(!y_trimmed.is_empty());
+//         assert!(y_trimmed.iter().all(|&v| v == 1.0));
+//         assert_eq!(y_trimmed.len(), idx[1] - idx[0]);
+//     }
+// }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #[cfg(test)]
 mod tests {

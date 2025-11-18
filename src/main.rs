@@ -177,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //let output_path = Some("output.wav".to_string());
 
     // Synthesize speech
-    let audio = engine.synthesize_async(&vec![text]);
+    let audio = engine.synthesize(&vec![text]);
 
     // Output to file or play
     /*
@@ -211,6 +211,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     */
-    
+
     Ok(())
 }

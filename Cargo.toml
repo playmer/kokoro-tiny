@@ -49,6 +49,8 @@ rodio = { version = "0.19", optional = true }
 audiopus = { version = "0.2", optional = true }
 threadpool = "1.8.1"
 lockfree = "0.5.1"
+tracing = "0.1.41"
+num-traits = "0.2.19"
 
 [features]
 default = ["playback"]
