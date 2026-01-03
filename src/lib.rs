@@ -20,7 +20,6 @@
 //! }
 //! ```
 
-use core::panic;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
@@ -30,16 +29,17 @@ use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 
+use audio_sample::ConvertTo;
 use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
-use tracing::instrument;
 use unicode_segmentation::UnicodeSegmentation;
 use espeak_rs::_text_to_phonemes;
-use ndarray::{ArrayBase, ArrayView, Dim, IxDyn, OwnedRepr, ViewRepr};
+use ndarray::{ArrayBase, IxDyn, OwnedRepr};
 use ndarray_npy::NpzReader;
 use ort::{
     session::{builder::GraphOptimizationLevel, Session, SessionInputs, SessionInputValue},
     value::{Tensor, Value},
 };
+
 
 #[cfg(feature = "playback")]
 use rodio::{Decoder, OutputStream, Sink};
@@ -127,7 +127,7 @@ impl Phonemizer {
 
         let split: Vec<&str> = current_string.splitn(2, c).collect();
         if split.len() == 2 {
-            phonemes[i] = split[0].to_string();
+            phonemes[i] = format!("{}{}", split[0], c);
             phonemes.insert(i + 1, split[1].to_string());
             return true;
         }
@@ -137,6 +137,11 @@ impl Phonemizer {
 
     
     pub fn graphemes_to_phonemes<'a>(&self, text: &'a str, _use_espeak: bool) -> Option<(&'a str, VecDeque<Vec<i64>>)>  {
+        if text.contains("It hurts it hurts it hurts. It hurts it hurts it hurts") {
+            println!("Whoops.")
+        }
+
+
         let mut phonemes: Vec<String> = text
             .unicode_sentences()
             .map(|s| _text_to_phonemes(s.trim(), "en-us", None, true, false)
@@ -169,32 +174,65 @@ impl Phonemizer {
         }
 
         // Now a splitting step.
+        
         let mut i = 0;
-
-        while phonemes[i].len() > 509 {
-            if Self::split_index(&mut phonemes, i, ';') && phonemes[i].len() > 509 {
-                continue;
-            }
+        while i != phonemes.len() {
+            let mut has_stepped = false;
+            while (phonemes[i].len() > 508) && (i < phonemes.len()) {
+                has_stepped = false;
+                if Self::split_index(&mut phonemes, i, ';') && phonemes[i].len() > 508 {
+                    if phonemes[i + 1].trim().len() == 0 {
+                        phonemes.pop();
+                    } else {
+                        continue;
+                    }
+                }
             
-            if phonemes[i].len() > 509 && Self::split_index(&mut phonemes, i, ',') && phonemes[i].len() > 509 {
-                continue;
+                if phonemes[i].len() > 508 && Self::split_index(&mut phonemes, i, ',') && phonemes[i].len() > 508 {
+                    if phonemes[i + 1].trim().len() == 0 {
+                        phonemes.pop();
+                    } else {
+                        continue;
+                    }
+                }
+
+                if phonemes[i].len() > 508 && Self::split_index(&mut phonemes, i, '-') && phonemes[i].len() > 508 {
+                    if phonemes[i + 1].trim().len() == 0 {
+                        phonemes.pop();
+                    } else {
+                        continue;
+                    }
+                }
+
+                if phonemes[i].len() > 508 && Self::split_index(&mut phonemes, i, ' ') && phonemes[i].len() > 508 {
+                    if phonemes[i + 1].trim().len() == 0 {
+                        phonemes.pop();
+                    } else {
+                        continue;
+                    }
+                }
+
+                i += 1;
+                has_stepped = true;
             }
 
-            if phonemes[i].len() > 509 && Self::split_index(&mut phonemes, i, '-') && phonemes[i].len() > 509 {
-                continue;
+            if !has_stepped {
+                i += 1;
             }
-
-            if phonemes[i].len() > 509 && Self::split_index(&mut phonemes, i, ' ') && phonemes[i].len() > 509 {
-                continue;
-            }
-
-            i += 1;
         }
 
         let tokens: Vec<_>  = phonemes.iter().map(|f| self.tokenize_phonemes(f)).collect(); 
 
-        if tokens.len() > 510 {
-            println!("Uh Oh!: \n{}", text);
+        let mut tokens_too_big = false;
+
+        for token_stream in &tokens {
+            if token_stream.len() > 510{
+                tokens_too_big = true;
+            }
+        }
+
+        if tokens_too_big {
+            panic!("Detected a token string too large to synthesize: {}", text);
         }
 
         Some((text, tokens.into()))
@@ -329,7 +367,7 @@ impl Chunk {
     }
 }
 
-struct Paragraph {
+pub struct Paragraph {
     finished_chunks: usize,
      // These need to be joined with internal trimming, so don't 
      // trim the start on the first chunk, or the end on the last chunk.
@@ -376,6 +414,67 @@ impl Section {
         Section { finished_paragraphs: 0, paragraphs: Vec::new() }
     }
 }
+
+pub trait Encoder {
+    fn feed_audio(&mut self, paragraph: Paragraph, finished: bool);
+}
+
+pub struct AACEncoder {
+    remaining_samples: Vec<i16>,
+    encoder: fdk_aac::enc::Encoder,
+    encoder_info: fdk_aac::enc::InfoStruct,
+    temp_output: Vec<u8>,
+    final_output: Vec<u8>
+}
+
+pub type AACEncoderBitrate = fdk_aac::enc::BitRate;
+
+impl AACEncoder {
+    pub fn new(bit_rate: AACEncoderBitrate) -> AACEncoder {
+        let params = fdk_aac::enc::EncoderParams{
+            bit_rate: bit_rate,
+            //bit_rate: fdk_aac::enc::BitRate::Cbr(24000),
+            sample_rate: SAMPLE_RATE,
+            transport: fdk_aac::enc::Transport::Raw,
+            //transport: fdk_aac::enc::Transport::Adts,
+            channels: fdk_aac::enc::ChannelMode::Mono,
+            audio_object_type: fdk_aac::enc::AudioObjectType::Mpeg4LowComplexity
+        };
+
+        let encoder = fdk_aac::enc::Encoder::new(params).unwrap();
+        let encoder_info: fdk_aac::enc::InfoStruct = encoder.info().unwrap();
+
+        AACEncoder { 
+            remaining_samples: Vec::new(),
+            encoder,
+            encoder_info,
+            temp_output: vec![0; (6144 / 8) * 1 /* channels */],
+            final_output: Vec::new()
+        }
+    }
+}
+
+impl Encoder for AACEncoder {
+    fn feed_audio(&mut self, paragraph: Paragraph, finished: bool) {
+        let coverted_audio: Vec<i16> = paragraph.combine_chunks().into_iter().map(|s| s.convert_to()).collect();
+        self.remaining_samples.extend(coverted_audio);
+
+        if !finished && self.remaining_samples.len() < (self.encoder_info.frameLength as usize) {
+            return;
+        }
+
+        let frames_to_send = (self.encoder_info.frameLength as usize).min(self.remaining_samples.len());
+        
+        let encoding_info = self.encoder.encode(
+            &self.remaining_samples[0..frames_to_send], 
+            &mut self.temp_output)
+            .unwrap();
+
+        self.final_output.extend(&self.temp_output[0..encoding_info.output_size]);
+    }
+}
+
+
 
 /// Main TTS engine struct
 pub struct TtsEngine {
@@ -569,6 +668,11 @@ impl TtsEngine {
                         let mut chunk = paragraph.1.pop_front().unwrap();
                         chunk.insert(0, 0);
                         chunk.push(0);
+
+                        if chunk.len() > 510 {
+                            println!("Oh no: \n{}", paragraph.0);
+                        }
+
                         inference_queue.push((i, j, k, chunk));
                     }
                 
@@ -584,22 +688,44 @@ impl TtsEngine {
         
         let mut audios: Vec<Vec<f32>> = Vec::new();
 
+        let mut samples_per_section: Vec<usize> = Vec::new();
+        let mut temp_wave_samples: Vec<f32> = Vec::new();
+
         for i in 0..sections.len() {
             std::thread::sleep(Duration::from_millis(1000));
             let mut copied_audio = false;
+            samples_per_section.push(0);
+            let mut paragraph_index = 0;
 
             while !copied_audio {
                 std::thread::sleep(Duration::from_millis(1000));
                 let generated_audios = audios_destination.clone();
-                let mut generated_audios = generated_audios.lock().unwrap();
 
-                if generated_audios[i].finished_paragraphs != generated_audios[i].paragraphs.len() {
-                    continue;
+                {
+                    let mut generated_audios = generated_audios.lock().unwrap();
+
+                    let length = generated_audios.len();
+                    for generated_paragraph in &mut generated_audios[i].paragraphs[paragraph_index..length] {
+                        if generated_paragraph.finished_chunks != generated_paragraph.chunks.len() {
+                            break;
+                        }
+
+                        paragraph_index += 1;
+                        let paragraph_data = generated_paragraph.combine_chunks();
+                        samples_per_section[i] += paragraph_data.len();
+                        temp_wave_samples.extend(paragraph_data);
+
+                        // Free this up now.
+                        generated_paragraph.chunks.clear();
+                    }
                 }
 
-                audios.push(generated_audios[i].paragraphs.iter().map(|f| f.combine_chunks()).flatten().collect());
-                generated_audios[i].paragraphs.clear();
-                copied_audio = true
+                //if generated_audios[i].finished_paragraphs != generated_audios[i].paragraphs.len() {
+                //    continue;
+                //}
+                //audios.push(generated_audios[i].paragraphs.iter().map(|f| f.combine_chunks()).flatten().collect());
+                //generated_audios[i].paragraphs.clear();
+                //copied_audio = true
             }
             
             println!("Finished section {i}");
@@ -809,42 +935,6 @@ impl TtsEngine {
         Ok(())
     }
 
-    #[cfg(feature = "flac-format")]
-    /// Save audio to FLAC file - lossless quality for when you're getting FLAC!
-    pub fn save_flac(&self, path: &str, audio: &[f32]) -> Result<(), String> {
-        use flac::StreamWriter;
-
-        // Ensure directory exists
-        if let Some(parent) = Path::new(path).parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory: {}", e))?;
-        }
-
-        // Convert to i32 samples (24-bit audio in 32-bit container)
-        let samples: Vec<i32> = audio.iter()
-            .map(|&s| (s * 8388607.0).clamp(-8388608.0, 8388607.0) as i32)
-            .collect();
-
-        // Create FLAC writer
-        let file = File::create(path)
-            .map_err(|e| format!("Failed to create file: {}", e))?;
-
-        let mut writer = StreamWriter::new(file, 24)
-            .map_err(|e| format!("Failed to create FLAC writer: {:?}", e))?;
-
-        // Write samples
-        for sample in samples {
-            writer.write_sample(sample)
-                .map_err(|e| format!("Failed to write FLAC sample: {:?}", e))?;
-        }
-
-        // Finalize
-        writer.finalize()
-            .map_err(|e| format!("Failed to finalize FLAC: {:?}", e))?;
-
-        Ok(())
-    }
-
     /// Save audio in any supported format based on file extension
     pub fn save_audio(&self, path: &str, audio: &[f32]) -> Result<(), String> {
         let extension = Path::new(path)
@@ -859,8 +949,6 @@ impl TtsEngine {
             "mp3" => self.save_mp3(path, audio),
             #[cfg(feature = "opus-format")]
             "opus" | "ogg" => self.save_opus(path, audio, 24000),
-            #[cfg(feature = "flac-format")]
-            "flac" => self.save_flac(path, audio),
             _ => Err(format!("Unsupported audio format: {}", extension))
         }
     }
