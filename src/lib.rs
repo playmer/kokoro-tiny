@@ -416,7 +416,7 @@ impl Section {
 }
 
 pub trait Encoder {
-    fn feed_audio(&mut self, paragraph: Paragraph, finished: bool);
+    fn feed_audio(&mut self, paragraph: &mut Paragraph, finished: bool) -> usize;
 }
 
 pub struct AACEncoder {
@@ -424,7 +424,8 @@ pub struct AACEncoder {
     encoder: fdk_aac::enc::Encoder,
     encoder_info: fdk_aac::enc::InfoStruct,
     temp_output: Vec<u8>,
-    final_output: Vec<u8>
+    final_output: Vec<u8>,
+    sample_sizes: Vec<u16>
 }
 
 pub type AACEncoderBitrate = fdk_aac::enc::BitRate;
@@ -449,28 +450,36 @@ impl AACEncoder {
             encoder,
             encoder_info,
             temp_output: vec![0; (6144 / 8) * 1 /* channels */],
-            final_output: Vec::new()
+            final_output: Vec::new(),
+            sample_sizes: Vec::new()
         }
     }
 }
 
 impl Encoder for AACEncoder {
-    fn feed_audio(&mut self, paragraph: Paragraph, finished: bool) {
-        let coverted_audio: Vec<i16> = paragraph.combine_chunks().into_iter().map(|s| s.convert_to()).collect();
-        self.remaining_samples.extend(coverted_audio);
+    fn feed_audio(&mut self, paragraph: &mut Paragraph, finished: bool) -> usize {
+        let converted_audio: Vec<i16> = paragraph.combine_chunks().into_iter().map(|s| s.convert_to()).collect();
+        paragraph.chunks.clear();
 
-        if !finished && self.remaining_samples.len() < (self.encoder_info.frameLength as usize) {
-            return;
-        }
+        let samples_grabbed = converted_audio.len();
+        self.remaining_samples.extend(converted_audio);
 
-        let frames_to_send = (self.encoder_info.frameLength as usize).min(self.remaining_samples.len());
+        loop {
+            if !finished && self.remaining_samples.len() < (self.encoder_info.frameLength as usize) {
+                return samples_grabbed;
+            }
+
+            let frames_to_send = (self.encoder_info.frameLength as usize).min(self.remaining_samples.len());
         
-        let encoding_info = self.encoder.encode(
-            &self.remaining_samples[0..frames_to_send], 
-            &mut self.temp_output)
-            .unwrap();
+            let encoding_info = self.encoder.encode(
+                &self.remaining_samples[0..frames_to_send], 
+                &mut self.temp_output)
+                .unwrap();
 
-        self.final_output.extend(&self.temp_output[0..encoding_info.output_size]);
+            self.final_output.extend(&self.temp_output[0..encoding_info.output_size]);
+            self.sample_sizes.push(encoding_info.output_size as u16);
+            self.remaining_samples.drain(0..encoding_info.input_consumed);
+        }
     }
 }
 
@@ -619,7 +628,7 @@ impl TtsEngine {
     }
 
     /// Synthesize speech from text
-    pub fn synthesize(&mut self, sections: &[&str]) -> Vec<Vec<f32>> {
+    pub fn synthesize(&mut self, sections: &Vec<(String, String)>) -> (Vec<u8>, Vec<u16>, Vec<(usize, String)>) {
         let inference_queue: Arc<lockfree::queue::Queue<(usize, usize, usize, Vec<i64>)>> = Arc::new(lockfree::queue::Queue::new());
 
         let audios_destination: Arc<Mutex<Vec<Section>>> = Arc::new(Mutex::new(Vec::new()));
@@ -649,6 +658,7 @@ impl TtsEngine {
                 }
 
                 let mut paragraphs: VecDeque<(&str, VecDeque<Vec<i64>>)> = section
+                    .1
                     .lines()
                     .filter_map(|t| self.phonemizer.graphemes_to_phonemes(t, true))
                     .collect();
@@ -685,7 +695,10 @@ impl TtsEngine {
         }
 
         std::thread::sleep(Duration::from_millis(200));
-        
+
+        let mut duration_so_far: usize = 0;
+        let mut chapter_markers: Vec<(usize, String)> = Vec::new();
+        let mut encoder = AACEncoder::new(fdk_aac::enc::BitRate::VbrMedium);
         let mut audios: Vec<Vec<f32>> = Vec::new();
 
         let mut samples_per_section: Vec<usize> = Vec::new();
@@ -697,6 +710,8 @@ impl TtsEngine {
             samples_per_section.push(0);
             let mut paragraph_index = 0;
 
+            chapter_markers.push((duration_so_far, sections[i].0.clone()));
+
             while !copied_audio {
                 std::thread::sleep(Duration::from_millis(1000));
                 let generated_audios = audios_destination.clone();
@@ -704,19 +719,16 @@ impl TtsEngine {
                 {
                     let mut generated_audios = generated_audios.lock().unwrap();
 
-                    let length = generated_audios.len();
+                    let length = generated_audios[i].paragraphs.len();
                     for generated_paragraph in &mut generated_audios[i].paragraphs[paragraph_index..length] {
                         if generated_paragraph.finished_chunks != generated_paragraph.chunks.len() {
                             break;
                         }
 
                         paragraph_index += 1;
-                        let paragraph_data = generated_paragraph.combine_chunks();
-                        samples_per_section[i] += paragraph_data.len();
-                        temp_wave_samples.extend(paragraph_data);
+                        copied_audio = paragraph_index == length;
 
-                        // Free this up now.
-                        generated_paragraph.chunks.clear();
+                        duration_so_far += encoder.feed_audio(generated_paragraph, copied_audio && i == sections.len());
                     }
                 }
 
@@ -731,7 +743,9 @@ impl TtsEngine {
             println!("Finished section {i}");
 
             //self.save_wav(&format!("audio_{i}.wav"), &audios.last().unwrap()).unwrap();
-            std::fs::write(&format!("audio_{i}.txt"), sections[i]).unwrap();
+            std::fs::write(&format!("audio_{i}.txt"), sections[i].1.clone()).unwrap();
+            
+
         }
         
         finished_queueing.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -740,7 +754,7 @@ impl TtsEngine {
             self.sessions.push(thread.join().unwrap());
         }
 
-        return audios;
+        return (encoder.final_output, encoder.sample_sizes, chapter_markers);
     }
 
     /// Play audio directly to the default audio device with volume control
