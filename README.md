@@ -6,18 +6,32 @@
 
 Minimal, blazing-fast TTS (Text-to-Speech) crate powered by the Kokoro model (82M params). Perfect for embedding in applications, system alerts, and smart tools!
 
-🚀 **0.5-2s time-to-first-audio** | 📦 **Single-file implementation** | 🎯 **Zero-config usage**
+The audiobook pipeline uses multiple independent model workers that consume a shared
+chunk queue while preserving source order in the encoded output.
 
 ## Features
 
-- ⚡ **Extremely fast inference** using ONNX Runtime
-- 🎨 **50+ built-in voices** with style mixing support
-- 🔊 **Direct audio playback** with volume control
-- 📁 **Multiple formats**: WAV, MP3, OPUS, FLAC
-- 💾 **Smart caching** - downloads model once to `~/.cache/kokoros`
-- 🛠️ **CLI included** - `kokoro-speak` for instant TTS
+- ⚡ **Native Candle inference** on CPU or CUDA, without ONNX Runtime
+- 🧠 **Candle-native G2P** with caller-controlled chunking
+- 🧵 **Concurrent model workers** configured independently for CPU and CUDA
+- 🎨 **Kokoro voice packs** loaded from converted SafeTensors
+- 📚 **Ordered AAC streaming** with chapter and sample-size metadata
+- 💾 **Local model storage** via `KOKORO_MODEL_DIR`
 
 ## Quick Start
+
+The model directory must contain:
+
+```text
+config.json
+model.safetensors
+voices/
+  af_heart.safetensors
+```
+
+Set `KOKORO_MODEL_DIR` to that directory. `KOKORO_CUDA_WORKERS` and
+`KOKORO_CPU_WORKERS` control the number of independently loaded models; both
+default to one when CUDA is enabled.
 
 Add to your `Cargo.toml`:
 
@@ -35,63 +49,12 @@ use kokoro_tiny::TtsEngine;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize (downloads model on first run)
-    let mut tts = TtsEngine::new().await?;
-
-    // Generate speech
-    let audio = tts.synthesize("Hello, world!", Some("af_sky"))?;
-
-    // Save to file
-    tts.save_wav("output.wav", &audio)?;
-
-    // Or play directly (with 'playback' feature)
-    #[cfg(feature = "playback")]
-    tts.play(&audio, 0.8)?;  // 80% volume
+    let mut tts = TtsEngine::new("af_heart").await?;
+    let sections = vec![("Chapter 1".to_string(), "Hello, world!".to_string())];
+    let (aac, sample_sizes, chapter_markers) = tts.synthesize(&sections);
 
     Ok(())
 }
-```
-
-### Voice Mixing
-
-Create unique voices by blending:
-
-```rust
-// Mix voices with weights
-let audio = tts.synthesize(
-    "Creative voice mixing!",
-    Some("af_sky.8+af_bella.2")  // 80% Sky + 20% Bella
-)?;
-```
-
-### CLI Tool
-
-Install the CLI:
-
-```bash
-cargo install kokoro-tiny
-```
-
-Use it instantly:
-
-```bash
-# Speak text
-kokoro-speak say "Hello from kokoro!"
-
-# System alerts
-kokoro-speak alert success "Build complete!"
-
-# Pipe input
-echo "Processing files..." | kokoro-speak pipe
-
-# Context summaries (perfect for smart-tree!)
-kokoro-speak context "Found 5 TypeScript files with 200 lines total"
-
-# Save to file
-kokoro-speak say "Save this speech" -o output.wav
-
-# List voices
-kokoro-speak --list-voices
 ```
 
 ## Available Voices
@@ -101,8 +64,6 @@ kokoro-speak --list-voices
 - **American**: af_sky, af_bella, am_adam, am_michael
 - **British**: bf_emma, bm_george
 - **Special**: af_heart (warm), am_echo (clear)
-
-Use `--list-voices` to see all options!
 
 ## Features
 
@@ -119,19 +80,15 @@ kokoro-tiny = { version = "0.1", features = ["all-formats"] }
 - `cuda` - GPU acceleration
 - `all-formats` - All audio formats
 
-## Examples
+The lower-level `candle-kokoro` crate exposes a `cudnn` feature, but this
+adapter uses plain CUDA because Candle 0.10.2's thread-local cuDNN handles
+cannot be safely torn down by the reusable worker lifecycle.
 
-Check out the [examples](https://github.com/8b-is/kokoro-tiny/tree/main/examples) directory:
+## Smoke Test
 
 ```bash
-# Simple usage
-cargo run --example simple
-
-# Test all voices
-cargo run --example test_voices
-
-# Audio format comparison
-cargo run --features all-formats --example audio_formats
+$env:KOKORO_MODEL_DIR = "C:\models\kokoro"
+cargo run --no-default-features --features cuda --example candle_smoke
 ```
 
 ## Performance
